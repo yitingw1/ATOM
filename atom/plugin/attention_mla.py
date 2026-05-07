@@ -587,7 +587,9 @@ class MLAAttentionImplPluginModeMethods:
         paged_kv_indptr = attn_metadata.plugin_metadata.decode.paged_kv_indptr
         paged_kv_indices = attn_metadata.plugin_metadata.decode.paged_kv_indices
 
-        mla_decode_fwd(
+        return_lse = self.need_to_return_lse_for_decode
+
+        _, lse = mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
@@ -605,10 +607,13 @@ class MLAAttentionImplPluginModeMethods:
             reduce_partial_map=reduce_partial_map,
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
+            return_lse=return_lse,
         )
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :]
-        return o, None
+            if lse is not None:
+                lse = lse[:, :: self.head_repeat_factor]
+        return o, lse
 
     def forward_impl_plugin_mode(
         self,
@@ -910,7 +915,28 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
         )
 
         self.supports_quant_query_input = False
-        self.dcp_world_size: int = -1
+
+        from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
+        try:
+            self.dcp_world_size = get_dcp_group().world_size
+            self.dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        try:
+            self.pcp_world_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
+        self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        self.can_return_lse_for_decode = True
+        self.need_to_return_lse_for_decode = (
+            self.dcp_world_size > 1 and self.can_return_lse_for_decode
+        )
+        self.supports_pcp = False
+        self.supports_mtp_with_cp_non_trivial_interleave_size = False
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
                 get_current_vllm_config()
