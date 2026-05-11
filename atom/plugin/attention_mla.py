@@ -300,6 +300,7 @@ class MLAAttentionImplPluginModeMethods:
                 toks=toks,
             )
 
+            kv_c_normed = kv_c_normed.squeeze(1)  # [sum_seq_len, 1, kv_lora_rank] → [sum_seq_len, kv_lora_rank]
             kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
@@ -556,9 +557,10 @@ class MLAAttentionImplPluginModeMethods:
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
         B = q.shape[0]
+        num_heads_q = q.shape[1]  # DCP 时为 128（all-gathered），否则为 16
         o = torch.empty(
             B,
-            self.padded_num_heads,
+            num_heads_q,
             self.kv_lora_rank,
             dtype=attn_metadata.plugin_metadata.decode.attn_out_dtype,
             device=q.device,
@@ -567,7 +569,8 @@ class MLAAttentionImplPluginModeMethods:
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
         use_persistent_mode = not (
-            self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
+            self.dcp_world_size > 1
+            # self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
         )
         if not use_persistent_mode:
             work_meta_data = None
