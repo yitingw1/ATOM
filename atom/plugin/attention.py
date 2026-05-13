@@ -1256,6 +1256,14 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         )
 
         self.qo_indptr = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
+        logger.info("plugin attention: dtypes.d_dtypes:%s", dtypes.d_dtypes)
+        # dtypes.d_dtypes:{'fp8': torch.float8_e4m3fnuz, 'fp8_e8m0': torch.float8_e8m0fnu, 'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float32, 'i4x2': torch.int4, 'fp4x2': torch.float4_e2m1fn_x2, 'u32': torch.uint32, 'i32': torch.int32, 'i16': torch.int16, 'i8': torch.int8, 'u8': torch.uint8, 'i64': torch.int64, 'u64': torch.uint64}
+        logger.info("plugin attention: config.cache_config.cache_dtype:%s", config.cache_config.cache_dtype)
+        # config.cache_config.cache_dtype:bfloat16
+        if config.cache_config.cache_dtype in ["bfloat16", "auto"]:
+            cache_dtype="bf16"
+        else:
+            cache_dtype=config.cache_config.cache_dtype
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -1269,7 +1277,7 @@ def create_mla_attn_metadata_builder_init_method(base_class):
             1,
             self.padded_num_attention_heads,
             torch.bfloat16,
-            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            dtypes.d_dtypes[cache_dtype],
             is_sparse=False,  # TODO: support sparse
             fast_mode=True,
         )

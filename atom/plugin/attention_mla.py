@@ -300,6 +300,7 @@ class MLAAttentionImplPluginModeMethods:
                 toks=toks,
             )
 
+            kv_c_normed = kv_c_normed.squeeze(1)  # [sum_seq_len, 1, kv_lora_rank] → [sum_seq_len, kv_lora_rank]
             kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
@@ -556,9 +557,10 @@ class MLAAttentionImplPluginModeMethods:
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
         B = q.shape[0]
+        num_heads_q = q.shape[1]  # DCP 时为 128（all-gathered），否则为 16
         o = torch.empty(
             B,
-            self.padded_num_heads,
+            num_heads_q,
             self.kv_lora_rank,
             dtype=attn_metadata.plugin_metadata.decode.attn_out_dtype,
             device=q.device,
@@ -567,7 +569,8 @@ class MLAAttentionImplPluginModeMethods:
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
         use_persistent_mode = not (
-            self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
+            self.dcp_world_size > 1
+            # self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
         )
         if not use_persistent_mode:
             work_meta_data = None
@@ -587,15 +590,58 @@ class MLAAttentionImplPluginModeMethods:
         paged_kv_indptr = attn_metadata.plugin_metadata.decode.paged_kv_indptr
         paged_kv_indices = attn_metadata.plugin_metadata.decode.paged_kv_indices
 
-        mla_decode_fwd(
+        return_lse = self.need_to_return_lse_for_decode
+
+        # Head folding: bypass gqa=128 ASM kernel by reshaping to gqa=16
+        # use_head_folding = return_lse and num_heads_q > 16
+        # if use_head_folding:
+        #     fold_factor = num_heads_q // 16
+        #     q = q.reshape(B * fold_factor, 16, -1)
+        #     o = o.reshape(B * fold_factor, 16, self.kv_lora_rank)
+        #     qo_indptr = torch.arange(
+        #         B * fold_factor + 1,
+        #         dtype=attn_metadata.plugin_metadata.decode.qo_indptr.dtype,
+        #         device=q.device,
+        #     )
+        #     orig_kv_indptr = paged_kv_indptr
+        #     kv_lens = orig_kv_indptr[1:] - orig_kv_indptr[:-1]
+        #     kv_lens_folded = kv_lens.repeat_interleave(fold_factor)
+        #     paged_kv_indptr = torch.zeros(
+        #         B * fold_factor + 1,
+        #         dtype=orig_kv_indptr.dtype, device=orig_kv_indptr.device,
+        #     )
+        #     paged_kv_indptr[1:] = kv_lens_folded.cumsum(0)
+        #     paged_kv_indices = torch.cat([
+        #         paged_kv_indices[orig_kv_indptr[i]:orig_kv_indptr[i + 1]]
+        #         for i in range(B)
+        #         for _ in range(fold_factor)
+        #     ])
+        #     paged_kv_last_page_len = (
+        #         attn_metadata.plugin_metadata.decode.paged_kv_last_page_len
+        #         .repeat_interleave(fold_factor)
+        #     )
+        #     max_qo_len = 1
+        # else:
+            # qo_indptr = attn_metadata.plugin_metadata.decode.qo_indptr
+            # paged_kv_last_page_len = (
+            #     attn_metadata.plugin_metadata.decode.paged_kv_last_page_len
+            # )
+            # max_qo_len = attn_metadata.plugin_metadata.decode.max_qo_len
+        qo_indptr = attn_metadata.plugin_metadata.decode.qo_indptr
+        paged_kv_last_page_len = (
+            attn_metadata.plugin_metadata.decode.paged_kv_last_page_len
+        )
+        max_qo_len = attn_metadata.plugin_metadata.decode.max_qo_len
+
+        _, lse = mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
-            attn_metadata.plugin_metadata.decode.qo_indptr,
+            qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
-            attn_metadata.plugin_metadata.decode.paged_kv_last_page_len,
-            attn_metadata.plugin_metadata.decode.max_qo_len,
+            paged_kv_last_page_len,
+            max_qo_len,
             sm_scale=self.scale,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
@@ -605,10 +651,38 @@ class MLAAttentionImplPluginModeMethods:
             reduce_partial_map=reduce_partial_map,
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
+            return_lse=return_lse,
         )
+
+        # if use_head_folding:
+        #     o = o.reshape(B, num_heads_q, self.kv_lora_rank)
+        #     if lse is not None:
+        #         lse = lse.reshape(B, num_heads_q)
+        # # ===== DEBUG: check mla_decode_fwd output =====
+        # import torch.distributed as dist
+        # if dist.get_rank() == 0 and not hasattr(self, '_dbg_cnt'):
+        #     self._dbg_cnt = 0
+        # if dist.get_rank() == 0 and self._dbg_cnt < 3:
+        #     self._dbg_cnt += 1
+        #     of = o.float()
+        #     logger.info(f"[DCP DEBUG step={self._dbg_cnt}] o: shape={tuple(o.shape)}, "
+        #               f"mean={of.mean().item():.6f}, std={of.std().item():.6f}, "
+        #               f"min={of.min().item():.6f}, max={of.max().item():.6f}, "
+        #               f"nan={o.isnan().sum().item()}, inf={o.isinf().sum().item()}, "
+        #               f"zero_ratio={((o == 0).sum().item() / max(o.numel(), 1)):.4f}")
+        #     if lse is not None:
+        #         logger.info(f"[DCP DEBUG step={self._dbg_cnt}] lse: shape={tuple(lse.shape)}, "
+        #                     f"mean={lse.mean().item():.6f}, std={lse.std().item():.6f}, "
+        #                     f"min={lse.min().item():.6f}, max={lse.max().item():.6f}, "
+        #                     f"nan={lse.isnan().sum().item()}, inf={lse.isinf().sum().item()}")
+        #     else:
+        #         logger.info(f"[DCP DEBUG step={self._dbg_cnt}] lse: None (return_lse={return_lse})")
+        # # ===== END DEBUG =====
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :]
-        return o, None
+            if lse is not None:
+                lse = lse[:, :: self.head_repeat_factor]
+        return o, lse
 
     def forward_impl_plugin_mode(
         self,
@@ -715,10 +789,13 @@ class MLAAttentionImplPluginModeMethods:
         decode_only = has_decode and not has_prefill
 
         if not decode_only:
-            if not hasattr(self, "_has_fused_rope_cache"):
-                self._has_fused_rope_cache = hasattr(
-                    ops, "concat_and_cache_mla_rope_fused"
-                )
+            # if not hasattr(self, "_has_fused_rope_cache"):
+            #     self._has_fused_rope_cache = hasattr(
+            #         ops, "concat_and_cache_mla_rope_fused"
+            #     )
+            ###################################################
+            ## [WA] concat_and_cache_mla_rope_fused has wrong logic when enabling DCP.
+            self._has_fused_rope_cache = False
             if kv_cache.numel() > 0 and self._has_fused_rope_cache:
                 ops.concat_and_cache_mla_rope_fused(
                     positions,
@@ -744,6 +821,21 @@ class MLAAttentionImplPluginModeMethods:
                         scale=layer._k_scale,
                     )
 
+        # ===== DEBUG: Print KV cache content after prefill write =====
+        from atom.plugin.debug_kv_cache_dcp import debug_kv_cache_after_prefill
+        debug_kv_cache_after_prefill(
+            kv_cache=kv_cache,
+            slot_mapping=attn_metadata.plugin_metadata.slot_mapping,
+            k_c_normed=k_c_normed,
+            k_pe=k_pe,
+            layer_num=self.layer_num,
+            num_decode_tokens=num_decode_tokens,
+            num_actual_toks=num_actual_toks,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        # ===== END DEBUG =====
+
         if fp8_attention:
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
@@ -760,6 +852,18 @@ class MLAAttentionImplPluginModeMethods:
 
         if has_decode:
             assert attn_metadata.plugin_metadata.decode is not None
+
+            # ===== DEBUG: Print KV cache content during decode =====
+            from atom.plugin.debug_kv_cache_dcp import debug_kv_cache_decode
+            debug_kv_cache_decode(
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                layer_num=self.layer_num,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                dcp_world_size=self.dcp_world_size,
+            )
+            # ===== END DEBUG =====
 
             decode_q_nope, decode_q_pe = decode_q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -796,37 +900,60 @@ class MLAAttentionImplPluginModeMethods:
                 )
 
             if decode_only:
-                decode_q = torch.empty(
-                    (
-                        decode_ql_nope.shape[0],
-                        self.num_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=(
-                        dtypes.fp8
-                        if self.kv_cache_dtype.startswith("fp8")
-                        else self.dtype
-                    ),
-                    device=decode_ql_nope.device,
+                # decode_q = torch.empty(
+                #     (
+                #         decode_ql_nope.shape[0],
+                #         self.num_heads,
+                #         self.kv_lora_rank + self.qk_rope_head_dim,
+                #     ),
+                #     dtype=(
+                #         dtypes.fp8
+                #         if self.kv_cache_dtype.startswith("fp8")
+                #         else self.dtype
+                #     ),
+                #     device=decode_ql_nope.device,
+                # )
+                # aiter.fused_qk_rope_concat_and_cache_mla(
+                #     decode_ql_nope,
+                #     decode_q_pe,
+                #     k_c_normed,
+                #     k_pe.squeeze(1),
+                #     kv_cache.view(
+                #         kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                #     ),
+                #     decode_q,
+                #     attn_metadata.plugin_metadata.slot_mapping,
+                #     layer._k_scale,
+                #     layer._q_scale,
+                #     positions,
+                #     self.rotary_emb.cos_cache,
+                #     self.rotary_emb.sin_cache,
+                #     is_neox=self.rotary_emb.is_neox_style,
+                #     is_nope_first=True,
+                # )
+                
+                ###################################################
+                ## [WA] aiter.fused_qk_rope_concat_and_cache_mla
+                ## has DCP bug: slot_idx < 0 causes early return,
+                ## skipping Q RoPE and q_out write.
+                ## Split into separate RoPE + concat + cache write.
+                ###################################################
+                self.rotary_emb(positions, decode_q_pe, k_pe)
+                decode_q = torch.cat(
+                    [decode_ql_nope, decode_q_pe], dim=-1
                 )
-                aiter.fused_qk_rope_concat_and_cache_mla(
-                    decode_ql_nope,
-                    decode_q_pe,
-                    k_c_normed,
-                    k_pe.squeeze(1),
-                    kv_cache.view(
-                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                    ),
-                    decode_q,
-                    attn_metadata.plugin_metadata.slot_mapping,
-                    layer._k_scale,
-                    layer._q_scale,
-                    positions,
-                    self.rotary_emb.cos_cache,
-                    self.rotary_emb.sin_cache,
-                    is_neox=self.rotary_emb.is_neox_style,
-                    is_nope_first=True,
-                )
+                if kv_cache.numel() > 0:
+                    aiter.concat_and_cache_mla(
+                        k_c_normed,
+                        k_pe.squeeze(1),
+                        kv_cache.view(
+                            kv_cache.shape[0], -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim
+                        ),
+                        attn_metadata.plugin_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=layer._k_scale,
+                    )
             else:
                 if fp8_attention:
                     assert decode_ql_nope.shape[0] == decode_q_pe.shape[0]
@@ -871,6 +998,26 @@ class MLAAttentionImplPluginModeMethods:
 
             # correct dcp attn_out with lse.
             if self.dcp_world_size > 1:
+                # # ===== DEBUG: DCP pipeline stage tracking =====
+                # import torch.distributed as dist
+                # _r0 = dist.get_rank() == 0
+                # if _r0 and not hasattr(self, '_dbg_cp_cnt'):
+                #     self._dbg_cp_cnt = 0
+                #     logger.info(f"[DCP INFO] dcp_world_size={self.dcp_world_size}, "
+                #               f"num_heads={self.num_heads}, "
+                #               f"need_to_return_lse={self.need_to_return_lse_for_decode}, "
+                #               f"kv_lora_rank={self.kv_lora_rank}")
+                # if _r0:
+                #     self._dbg_cp_cnt += 1
+                # if _r0 and self._dbg_cp_cnt <= 3:
+                #     af = attn_out.float()
+                #     logger.info(f"[DCP CP step={self._dbg_cp_cnt}] BEFORE cp_lse_ag_out_rs: "
+                #                 f"attn_out={tuple(attn_out.shape)}, "
+                #                 f"mean={af.mean().item():.6f}, std={af.std().item():.6f}, "
+                #                 f"lse={tuple(lse.shape) if lse is not None else None}, "
+                #                 f"lse_mean={lse.mean().item():.6f}" if lse is not None else "")
+                # # ===== END DEBUG =====
+
                 attn_out = cp_lse_ag_out_rs(
                     attn_out,
                     lse,
@@ -878,8 +1025,35 @@ class MLAAttentionImplPluginModeMethods:
                     is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
                 )
 
+                # # ===== DEBUG: after cp_lse_ag_out_rs =====
+                # if _r0 and self._dbg_cp_cnt <= 3:
+                #     af2 = attn_out.float()
+                #     logger.info(f"[DCP CP step={self._dbg_cp_cnt}] AFTER cp_lse_ag_out_rs: "
+                #                 f"attn_out={tuple(attn_out.shape)}, "
+                #                 f"mean={af2.mean().item():.6f}, std={af2.std().item():.6f}, "
+                #                 f"nan={attn_out.isnan().sum().item()}, "
+                #                 f"inf={attn_out.isinf().sum().item()}, "
+                #                 f"zero_ratio={((attn_out == 0).sum().item() / max(attn_out.numel(), 1)):.4f}")
+                # # ===== END DEBUG =====
+
             # v_up projection
             self._v_up_proj(attn_out, out=output[:num_decode_tokens])
+
+            # # ===== DEBUG: after v_up_proj (works for both DCP and non-DCP) =====
+            # import torch.distributed as dist
+            # if not hasattr(self, '_dbg_vup_cnt'):
+            #     self._dbg_vup_cnt = 0
+            # if dist.get_rank() == 0:
+            #     self._dbg_vup_cnt += 1
+            # if dist.get_rank() == 0 and self._dbg_vup_cnt <= 3:
+            #     of = output[:num_decode_tokens].float()
+            #     _mode = "DCP" if self.dcp_world_size > 1 else "TP"
+            #     logger.info(f"[{_mode} VPROJ step={self._dbg_vup_cnt}] "
+            #                 f"attn_out={tuple(attn_out.shape)}, "
+            #                 f"output={tuple(output[:num_decode_tokens].shape)}, "
+            #                 f"mean={of.mean().item():.6f}, std={of.std().item():.6f}, "
+            #                 f"min={of.min().item():.6f}, max={of.max().item():.6f}")
+            # # ===== END DEBUG =====
 
         return output_padded
 
@@ -910,7 +1084,28 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
         )
 
         self.supports_quant_query_input = False
-        self.dcp_world_size: int = -1
+
+        from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
+        try:
+            self.dcp_world_size = get_dcp_group().world_size
+            self.dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        try:
+            self.pcp_world_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
+        self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        self.can_return_lse_for_decode = True
+        self.need_to_return_lse_for_decode = (
+            self.dcp_world_size > 1 and self.can_return_lse_for_decode
+        )
+        self.supports_pcp = False
+        self.supports_mtp_with_cp_non_trivial_interleave_size = False
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
                 get_current_vllm_config()
