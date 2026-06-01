@@ -202,24 +202,26 @@ def pad_for_all_gather(x: torch.Tensor):
     return padded_x, original_batch_size
 
 
-def all_gather_with_padding(x: torch.Tensor):
+def all_gather_with_padding(x: torch.Tensor, group=None):
     padded_x, original_batch_size = pad_for_all_gather(x)
+    if group is None:
+        group = get_dp_group()
     # use_custom=True routes through CA IPC (outplace_all_gather). Default
     # use_custom=False falls back to torch.distributed.all_gather_into_tensor
     # (NCCL), whose WorkNCCL end-event recorded inside CUDAGraph capture is
     # later queried by the watchdog thread -> hipErrorCapturedEvent crash.
-    gathered_hidden_states = get_dp_group().all_gather(padded_x, use_custom=True, dim=0)
+    gathered_hidden_states = group.all_gather(padded_x, use_custom=True, dim=0)
     return gathered_hidden_states, original_batch_size
 
 
 def reduce_scatter_with_unpadding(
-    x: torch.Tensor, original_batch_size: int
+    x: torch.Tensor, original_batch_size: int, group=None
 ) -> torch.Tensor:
     dim = 0
-    dp_group = get_dp_group()
+    if group is None:
+        group = get_dp_group()
 
-    # scattered_output = dp_group.reduce_scatter(x, dim=dim)
-    scattered_output = dp_group.reduce_scatter_tensor(x)
+    scattered_output = group.reduce_scatter_tensor(x)
 
     if scattered_output.shape[dim] > original_batch_size:
         slices = [slice(None)] * scattered_output.ndim
@@ -281,8 +283,10 @@ def dp_gather_hidden_and_router(
             router_logits = router_logits.contiguous()
         return hidden_states, router_logits, original_hidden_size, sizes
 
-    hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
-    router_logits, _ = all_gather_with_padding(router_logits)
+    hidden_states, original_hidden_size = all_gather_with_padding(
+        hidden_states, dp_group
+    )
+    router_logits, _ = all_gather_with_padding(router_logits, dp_group)
     return hidden_states, router_logits, original_hidden_size, None
 
 
@@ -2980,6 +2984,12 @@ class FusedMoE(torch.nn.Module):
         )
         if use_dp_gather_scatter:
             ctx = get_forward_context()
+            # DP all_gather/reduce_scatter aggregates tokens across DP ranks.
+            # In DP+TP mode, same-DP-rank TP workers have identical hidden
+            # states (post attention TP all_reduce), so we only gather across
+            # the DP dimension. Each TP rank then computes its own expert
+            # shard (via flatten_tp_across_dp), and the subsequent TP
+            # all_reduce in combine_outputs merges the expert contributions.
             dp_group = get_dp_group()
             dp_eager_mode = not ctx.context.dp_uniform_decode
 
@@ -3037,7 +3047,7 @@ class FusedMoE(torch.nn.Module):
                 )
             else:
                 final_hidden_states = reduce_scatter_with_unpadding(
-                    final_hidden_states, original_hidden_size
+                    final_hidden_states, original_hidden_size, dp_group
                 )
             if _tbo:
                 tbo_yield_and_switch_from_comm_to_compute()

@@ -30,14 +30,27 @@ class CoreManager:
         self.label = "Engine Core Mgr"
         self._closed = False  # Track whether already closed
         if config.enable_dp_attention:
-            self.local_engine_count = (
-                config.tensor_parallel_size * config.parallel_config.data_parallel_size
-            )
-            logger.info(
-                f"Enable dp attention, using {self.local_engine_count} data parallel ranks"
-            )
-            config.parallel_config.data_parallel_size = self.local_engine_count
-            config.tensor_parallel_size = 1
+            if config.parallel_config.data_parallel_size > 1:
+                # Explicit dp_size: DP+TP coexist. Each DP rank is an engine
+                # with tp_size GPU workers doing tensor-parallel attention.
+                self.local_engine_count = config.parallel_config.data_parallel_size
+                logger.info(
+                    f"Enable dp attention: {self.local_engine_count} DP ranks, "
+                    f"TP={config.tensor_parallel_size} within each DP rank"
+                )
+            else:
+                # No explicit dp_size: legacy behavior — flatten TP into DP
+                # so every GPU becomes an independent DP rank.
+                self.local_engine_count = (
+                    config.tensor_parallel_size
+                    * config.parallel_config.data_parallel_size
+                )
+                logger.info(
+                    f"Enable dp attention, using {self.local_engine_count} "
+                    f"data parallel ranks"
+                )
+                config.parallel_config.data_parallel_size = self.local_engine_count
+                config.tensor_parallel_size = 1
         else:
             self.local_engine_count = config.parallel_config.data_parallel_size
         self.ctx = zmq.Context(io_threads=2)
