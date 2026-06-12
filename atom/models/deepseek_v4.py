@@ -2630,9 +2630,24 @@ class Block(nn.Module):
             self.norm_eps,
         )
         x = hc_state.x_prev
+        # PCP MoE mode B: all-gather this rank's 1/W token shard back to the
+        # full (padded) sequence so MoE sees every token (MoE itself is
+        # untouched / PCP-agnostic), then slice the result back to 1/W to match
+        # the residual stream (which stays sharded throughout). Mode A leaves x
+        # at 1/W and MoE runs per-shard with no extra comm. Only `x` is
+        # gathered/sliced — fuse_hc already produced the 1/W ffn input, and the
+        # residual in hc_state remains 1/W. The gather length is the fixed
+        # padded total (not data-dependent), so it is torch.compile-safe like
+        # the K/V all-gather inside attention.forward_impl.
+        moe_merge = _moe_pcp_merge_active()
+        if moe_merge:
+            pcp_ws = get_pcp_world_size()
+            x = pcp_allgather_rerange(x, pcp_ws)  # [1/W, dim] -> [full, dim]
         x = self.ffn(
             x
         )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)
+        if moe_merge:
+            x = pcp_split_stripe(x, pcp_ws)  # [full, dim] -> [1/W, dim]
         hc_state.x_prev = x
         return hc_state
 
@@ -2714,6 +2729,19 @@ def _pcp_active() -> bool:
         return False
     fc = get_forward_context()
     return fc.context.is_prefill and not fc.context.is_dummy_run
+
+
+def _moe_pcp_merge_active() -> bool:
+    """Whether PCP MoE mode B (all-gather hidden -> full before MoE, slice back
+    after) applies in this forward.
+
+    True only when this is a real PCP prefill (`_pcp_active`) AND the
+    `moe_pcp_merge` flag is set. Mode A (default) returns False: MoE runs on the
+    1/W shard with no extra comm.
+    """
+    if not _pcp_active():
+        return False
+    return bool(get_current_atom_config().parallel_config.moe_pcp_merge)
 
 
 @support_torch_compile
@@ -2937,6 +2965,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         # runs entirely on 1/W; the final hidden is all-gathered + un-padded
         # after self.model(...) returns.
         use_pcp = _pcp_active()
+        moe_merge = _moe_pcp_merge_active()
+        # Mode B is incompatible with DP-attention id-gathering for now: both
+        # rewrite ctx.context.input_ids with different (full-PCP vs DP-gathered)
+        # token sets, and stacking them is unverified. Disallow until needed.
+        assert not (moe_merge and self._need_ids_gather), (
+            "moe_pcp_merge (PCP MoE mode B) is not supported together with "
+            "DP-attention input-id gathering yet."
+        )
+        full_padded_ids = None
         if use_pcp:
             pcp_size = get_pcp_world_size()
             n_global = input_ids.shape[0]
@@ -2944,6 +2981,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             if pad > 0:
                 input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
                 positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
+            # Mode B: stash the full (padded, global-order) ids for hash MoE,
+            # which sees full tokens after the per-layer all-gather. The token
+            # order matches pcp_allgather_rerange's reconstruction in Block.
+            if moe_merge:
+                full_padded_ids = input_ids
             input_ids = pcp_split_stripe(input_ids, pcp_size)
             positions = pcp_split_stripe(positions, pcp_size)
 
@@ -2957,6 +2999,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             ctx.context.input_ids = _run_on_tbo_comm_stream(
                 MoE._gather_ids_for_dp, input_ids.flatten(), ctx
             )
+        elif moe_merge:
+            # Hash MoE runs on the full token set in mode B (each Block
+            # all-gathers hidden before MoE), so the ids it indexes must be full.
+            ctx.context.input_ids = full_padded_ids
         else:
             ctx.context.input_ids = input_ids
         h = self.model(input_ids, positions)
