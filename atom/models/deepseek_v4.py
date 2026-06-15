@@ -45,11 +45,13 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from atom.distributed.pcp_utils import (
+    get_pcp_rank,
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_pad_len,
     pcp_split_stripe,
 )
+from atom.utils.custom_register import direct_register_custom_op
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -2642,11 +2644,48 @@ class Block(nn.Module):
         moe_merge = _moe_pcp_merge_active()
         if moe_merge:
             pcp_ws = get_pcp_world_size()
+            padded_total = x.shape[0] * pcp_ws  # full padded token count
             x = pcp_allgather_rerange(x, pcp_ws)  # [1/W, dim] -> [full, dim]
+            # Drop the trailing dummy (pad) rows so MoE sees exactly the real
+            # token set — identical to the no-PCP (pcp=1) batch. Dummies sit at
+            # [n_real, padded_total) because entry padding appends zeros at the
+            # tail and stripe split + allgather-rerange preserve global order.
+            # Without this, padded dummies change the fp8 block-scale M-tiling /
+            # moe_sorting and perturb every real token's MoE output (mode B was
+            # ~5 gsm8k points below pcp=1; see plan §dual-path).
+            n_real = get_forward_context().context.pcp_n_real
+            n_pad = padded_total - n_real if n_real is not None else 0
+            if n_pad > 0:
+                x = x[:n_real]
+            if os.environ.get("ATOM_PCP_PROBE", ""):
+                x = torch.ops.aiter.pcp_probe(
+                    x, self.layer_id, n_real if n_real is not None else -1, n_pad
+                )
+        # MoE in/out dump (env ATOM_PCP_IO_DIR): mode B dumps post-dummy-drop
+        # full x; pcp=1 dumps native full x. Compare per-token to split
+        # "attention-side x differs" from "MoE not per-token".
+        _io_dbg = bool(os.environ.get("ATOM_PCP_IO_DIR", ""))
+        if _io_dbg and moe_merge:
+            x = _pcp_dump_io(self.layer_id, _DUMP_B_FULL, 1, x)
+        elif _io_dbg and _pcp_active():  # mode A: this rank's 1/W shard input
+            x = _pcp_dump_io(self.layer_id, _DUMP_A_SHARD, 1, x)
+        elif _io_dbg and get_pcp_world_size() <= 1 and _pcp_dump_is_prefill():
+            x = _pcp_dump_io(self.layer_id, _DUMP_P1_FULL, 1, x)
         x = self.ffn(
             x
         )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)
+        if _io_dbg and moe_merge:
+            x = _pcp_dump_io(self.layer_id, _DUMP_B_FULL, 0, x)
+        elif _io_dbg and _pcp_active():
+            x = _pcp_dump_io(self.layer_id, _DUMP_A_SHARD, 0, x)
+        elif _io_dbg and get_pcp_world_size() <= 1 and _pcp_dump_is_prefill():
+            x = _pcp_dump_io(self.layer_id, _DUMP_P1_FULL, 0, x)
         if moe_merge:
+            if n_pad > 0:
+                # Re-pad the dropped dummy rows (zeros) so the split below lines
+                # up with the 1/W residual stream; these rows land at a rank's
+                # tail and are clipped by the entry's h[:n_global] on exit.
+                x = torch.cat([x, x.new_zeros(n_pad, *x.shape[1:])], dim=0)
             x = pcp_split_stripe(x, pcp_ws)  # [full, dim] -> [1/W, dim]
         hc_state.x_prev = x
         return hc_state
@@ -2716,6 +2755,147 @@ class ParallelHead(ParallelLMHead):
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)  # [num_tokens, dim]
         # get_logits handles the per-rank vocab shard + all-gather internally.
         return self.get_logits(norm(x))  # [bs, vocab]
+
+
+# Debug aid (PCP MoE mode B dump): layers already dumped, so we print the
+# A-vs-B per-token diff only on the first prefill forward of each layer.
+_PCP_DUMP_SEEN_LAYERS: set = set()
+
+# Phase B: dump per-layer MoE output to disk for offline mode-A vs mode-B
+# compare. Gated by env ATOM_PCP_DUMP_DIR (set in the worker via the launch
+# command). torch._dynamo.disable forces eager execution so the torch.save
+# side effect is NOT swallowed by the compiled graph (the reason in-graph
+# print/save vanished in earlier attempts). Only first prefill forward per
+# (layer, rank) is saved (dedup via the file existing / seen set is per-proc).
+_PCP_DUMP_B_SEEN: set = set()
+
+# Dump mode codes (int, not str/bool — custom op args must be plain scalars and
+# a bool can't distinguish three cases). Maps to the on-disk filename tag.
+_DUMP_A_SHARD = 0  # mode A: this rank's 1/W stripe MoE output
+_DUMP_B_FULL = 1  # mode B: full [N,dim] global-order MoE output (pre-split)
+_DUMP_P1_FULL = 2  # pcp=1 ground truth: native full-token MoE output
+_DUMP_MODE_TAG = {_DUMP_A_SHARD: "A_shard", _DUMP_B_FULL: "B_full", _DUMP_P1_FULL: "P1_full"}
+
+
+def _pcp_dump_moe_impl(out: torch.Tensor, layer_id: int, mode: int) -> torch.Tensor:
+    """Custom-op body: save MoE output, return out unchanged (passthrough).
+    Registered as a torch custom op so it is a true Dynamo barrier — plain
+    Python side effects (print / torch.save / @dynamo.disable) inside the
+    compiled Block.forward are silently dropped, but a custom op is not.
+    mode: 0=A_shard [1/W,dim] this rank's stripe, 1=B_full [full,dim] global
+    order, 2=P1_full pcp=1 ground truth. Reads env dynamically (spawn-safe)."""
+    dump_dir = os.environ.get("ATOM_PCP_DUMP_DIR", "")
+    tag = _DUMP_MODE_TAG.get(mode, f"mode{mode}")
+    if dump_dir:
+        rank = get_pcp_rank()
+        key = (layer_id, rank, mode)
+        if key not in _PCP_DUMP_B_SEEN:
+            _PCP_DUMP_B_SEEN.add(key)
+            path = f"{dump_dir}/moe_{tag}_layer{layer_id:02d}_rank{rank}.pt"
+            torch.save(out.detach().float().cpu(), path)
+    return out.clone()
+
+
+def _pcp_dump_moe_fake(out: torch.Tensor, layer_id: int, mode: int) -> torch.Tensor:
+    return torch.empty_like(out)
+
+
+direct_register_custom_op(
+    op_name="pcp_dump_moe",
+    op_func=_pcp_dump_moe_impl,
+    mutates_args=(),
+    fake_impl=_pcp_dump_moe_fake,
+)
+
+
+def _pcp_dump_moe_out(layer_id: int, mode: int, out: torch.Tensor) -> torch.Tensor:
+    return torch.ops.aiter.pcp_dump_moe(out, layer_id, mode)
+
+
+# In-graph probe for the mode-B dummy-drop fix: prints the actual n_real / shape
+# at runtime (a custom op survives the compiled graph; plain print is dropped).
+# Env-gated by ATOM_PCP_PROBE; logs only the first call per layer/rank.
+_PCP_PROBE_SEEN: set = set()
+
+
+def _pcp_probe_impl(x: torch.Tensor, layer_id: int, n_real: int, n_pad: int) -> torch.Tensor:
+    if os.environ.get("ATOM_PCP_PROBE", ""):
+        rank = get_pcp_rank()
+        key = (layer_id, rank)
+        if key not in _PCP_PROBE_SEEN:
+            _PCP_PROBE_SEEN.add(key)
+            try:
+                with open("/tmp/pcp_probe.txt", "a") as f:
+                    f.write(f"layer={layer_id} rank={rank} x.shape0={x.shape[0]} "
+                            f"n_real={n_real} n_pad={n_pad}\n")
+            except Exception:  # noqa: BLE001
+                pass
+    return x.clone()
+
+
+def _pcp_probe_fake(x: torch.Tensor, layer_id: int, n_real: int, n_pad: int) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="pcp_probe",
+    op_func=_pcp_probe_impl,
+    mutates_args=(),
+    fake_impl=_pcp_probe_fake,
+)
+
+
+# ---- MoE input/output dump for mode-B vs P1 per-token compare ----
+# Dumps BOTH the MoE input x (post-gather, post-dummy-drop, pre-ffn) and the
+# MoE output, in full global token order. Lets us split "attention-side x
+# already differs" from "MoE itself is not per-token". Env ATOM_PCP_IO_DIR.
+# is_in: 1 => MoE input, 0 => MoE output. mode tag from _DUMP_MODE_TAG.
+_PCP_IO_SEEN: set = set()
+
+
+def _pcp_dump_io_impl(
+    t: torch.Tensor, layer_id: int, mode: int, is_in: int
+) -> torch.Tensor:
+    dump_dir = os.environ.get("ATOM_PCP_IO_DIR", "")
+    if dump_dir:
+        rank = get_pcp_rank()
+        tag = _DUMP_MODE_TAG.get(mode, f"mode{mode}")
+        io = "in" if is_in else "out"
+        # Key by token count too so the multi-request (larger N) batch and any
+        # single-request warmup forward land in distinct files instead of the
+        # first one shadowing the rest.
+        n = int(t.shape[0])
+        key = (layer_id, rank, mode, is_in, n)
+        if key not in _PCP_IO_SEEN:
+            _PCP_IO_SEEN.add(key)
+            path = f"{dump_dir}/moeio_{tag}_{io}_layer{layer_id:02d}_rank{rank}_n{n:04d}.pt"
+            torch.save(t.detach().float().cpu(), path)
+    return t.clone()
+
+
+def _pcp_dump_io_fake(
+    t: torch.Tensor, layer_id: int, mode: int, is_in: int
+) -> torch.Tensor:
+    return torch.empty_like(t)
+
+
+direct_register_custom_op(
+    op_name="pcp_dump_io",
+    op_func=_pcp_dump_io_impl,
+    mutates_args=(),
+    fake_impl=_pcp_dump_io_fake,
+)
+
+
+def _pcp_dump_io(layer_id: int, mode: int, is_in: int, t: torch.Tensor) -> torch.Tensor:
+    return torch.ops.aiter.pcp_dump_io(t, layer_id, mode, is_in)
+
+
+def _pcp_dump_is_prefill() -> bool:
+    """Real prefill (not decode / dummy warmup), regardless of PCP. Used to gate
+    the pcp=1 ground-truth dump where _pcp_active() is always False."""
+    fc = get_forward_context()
+    return fc.context.is_prefill and not fc.context.is_dummy_run
 
 
 def _pcp_active() -> bool:
@@ -3003,6 +3183,15 @@ class DeepseekV4ForCausalLM(nn.Module):
             # Hash MoE runs on the full token set in mode B (each Block
             # all-gathers hidden before MoE), so the ids it indexes must be full.
             ctx.context.input_ids = full_padded_ids
+            # Real (pre-pad) token count so each Block can drop the trailing
+            # dummy rows before MoE (mode B), making the expert batch match the
+            # no-PCP (pcp=1) batch. Dummies sit at full index [n_global, pad_len)
+            # because entry padding appends zeros at the tail.
+            ctx.context.pcp_n_real = n_global
+            if os.environ.get("ATOM_PCP_PROBE", ""):
+                print(f"[PCP-PROBE entry] n_global={n_global} pad={pad} "
+                      f"padded_total={n_global+pad} pcp_n_real set={ctx.context.pcp_n_real}",
+                      flush=True)
         else:
             ctx.context.input_ids = input_ids
         h = self.model(input_ids, positions)

@@ -326,6 +326,13 @@ class Context:
     # that need the token ids but cannot receive them as a function arg
     # (the op signature is fixed by the consumer's plugin contract).
     input_ids: Optional[torch.Tensor] = None
+    # PCP MoE mode B only: real (pre-pad) prefill token count. The entry
+    # (ForCausalLM.forward) pads tokens to a multiple of pcp_size before the
+    # stripe split; in mode B each Block all-gathers back to the padded full
+    # length and must drop the trailing dummy rows before MoE so the batch the
+    # experts see matches the no-PCP (pcp=1) batch. Set at the un-compiled
+    # entry; read inside the compiled Block. None when not mode B.
+    pcp_n_real: Optional[int] = None
 
     def __init__(
         self,
@@ -338,6 +345,7 @@ class Context:
         dp_uniform_decode: bool = True,
         forward_mode: Optional[ForwardMode] = None,
         input_ids: Optional[torch.Tensor] = None,
+        pcp_n_real: Optional[int] = None,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -348,6 +356,7 @@ class Context:
         self.dp_uniform_decode = dp_uniform_decode
         self.forward_mode = forward_mode
         self.input_ids = input_ids
+        self.pcp_n_real = pcp_n_real
 
 
 @dataclass
