@@ -49,10 +49,8 @@ from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_pad_len,
-    pcp_split_stripe,
+    pcp_round_robin_split,
 )
-from atom.utils.custom_register import direct_register_custom_op
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -1019,10 +1017,10 @@ class Compressor(nn.Module):
         coff_d = (1 + overlap) * d
         combined = self.wkv_gate(x)
         # ===== PCP (full-KV) =====
-        # `x` here is this rank's 1/W stripe shard (model.forward entry split).
+        # `x` here is this rank's 1/W round-robin shard (model.forward entry split).
         # The wkv_gate projection above is per-token (parallelizable), but the
         # downstream fused_compress_attn compresses `ratio` CONSECUTIVE tokens
-        # into one entry — which stripe split breaks. So all-gather the
+        # into one entry — which round-robin split breaks. So all-gather the
         # projected `combined` back to full sequence order before compression,
         # mirroring SGLang's compute_kv_score (all-gather kv_score after the
         # projection, before the cross-token compress). The plan /
@@ -1887,7 +1885,7 @@ class DeepseekV4Attention(nn.Module):
             # `kv` tensor (in-chunk SWA tail; extend buffer is layer-invariant).
             #
             # ===== PCP (full-KV) =====
-            # Under PCP the model.forward entry stripe-split x/positions to 1/W,
+            # Under PCP the model.forward entry round-robin-split x/positions to 1/W,
             # so `q_sa` and `kv` here are this rank's 1/W shard. The per-query
             # metadata (kv_indptr/indices_*, indexer_meta) was already reduced
             # to this rank's owned queries in the builder (_apply_pcp_reindex),
@@ -2332,10 +2330,9 @@ class MoE(nn.Module):
             sizes = ctx.dp_metadata.get_sizes_across_dp()
             ids_2d = all_gatherv(ids_2d, sizes, get_dp_group())
         else:
-            from atom.model_ops.moe import pad_for_all_gather
+            from atom.model_ops.moe import all_gather_with_padding
 
-            ids_2d, _ = pad_for_all_gather(ids_2d)
-            ids_2d = get_dp_group().all_gather(ids_2d, use_custom=False, dim=0)
+            ids_2d, _ = all_gather_with_padding(ids_2d, use_cag=False)
         return ids_2d.flatten()
 
     def combine_outputs(
@@ -2372,7 +2369,7 @@ class MoE(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         routed = self.routed_expert_forward(x)
         with torch.cuda.stream(self.alt_stream):
-            shared = self.shared_experts(x)
+            shared = self.shared_experts.forward(x)
         current_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(routed, shared)
 
@@ -2899,7 +2896,7 @@ def _pcp_dump_is_prefill() -> bool:
 
 
 def _pcp_active() -> bool:
-    """Whether to apply PCP stripe-split in this forward.
+    """Whether to apply PCP round-robin-split in this forward.
 
     True only when pcp_size > 1 AND this is a real prefill forward (not decode,
     not dummy/warmup run). Decode runs PCP-redundant (full KV, no split); the
@@ -3000,7 +2997,7 @@ class DeepseekV4Model(nn.Module):
         MTP draft consume it without re-expanding from a dim-reduced state.
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
-        # PCP note: under PCP, `input_ids`/`positions` arrive already stripe-
+        # PCP note: under PCP, `input_ids`/`positions` arrive already round-robin-
         # split to this rank's 1/W shard (done in DeepseekV4ForCausalLM.forward,
         # OUTSIDE the torch.compile boundary — keeping comms / dynamic padding
         # out of the compiled graph). So everything here runs on the 1/W shard;
@@ -3132,7 +3129,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # correct hash routing without a separate setup step.
         ctx = get_forward_context()
 
-        # ===== PCP: stripe-split the prefill sequence OUTSIDE torch.compile =====
+        # ===== PCP: round-robin-split the prefill sequence OUTSIDE torch.compile =====
         # PCP splits the prefill query sequence across the PCP group (full-KV
         # scheme). This must happen here in ForCausalLM.forward (NOT in the
         # @support_torch_compile-wrapped DeepseekV4Model.forward) so the
@@ -3141,7 +3138,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # desync). Mirrors SGLang, which does cp_round_robin on input_ids in
         # the un-compiled ForCausalLM.forward. We pad tokens to a multiple of
         # pcp_size (dummy tokens, zero-length KV in the builder metadata), then
-        # stripe-split input_ids/positions to this rank's 1/W shard. The model
+        # round-robin-split input_ids/positions to this rank's 1/W shard. The model
         # runs entirely on 1/W; the final hidden is all-gathered + un-padded
         # after self.model(...) returns.
         use_pcp = _pcp_active()
@@ -3166,19 +3163,22 @@ class DeepseekV4ForCausalLM(nn.Module):
             # order matches pcp_allgather_rerange's reconstruction in Block.
             if moe_merge:
                 full_padded_ids = input_ids
-            input_ids = pcp_split_stripe(input_ids, pcp_size)
-            positions = pcp_split_stripe(positions, pcp_size)
+            input_ids = pcp_round_robin_split(input_ids, pcp_size)
+            positions = pcp_round_robin_split(positions, pcp_size)
 
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
-            # gate sees DP-gathered gating_output, so gather ids to match. This
-            # runs for every forward, including each TBO ubatch, which invokes
-            # this same forward with its own local slice + ubatch context.
-            # Route through the routing-side stream so the all-gather does not
-            # serialize behind the main compute stream during TBO ping-pong.
-            ctx.context.input_ids = _run_on_tbo_comm_stream(
-                MoE._gather_ids_for_dp, input_ids.flatten(), ctx
-            )
+            # gate sees DP-gathered gating_output, so gather ids to match. Run
+            # the gather INLINE on the compute stream. The original side-stream
+            # hop (_run_on_tbo_comm_stream) coordinated this ids all-gather with
+            # a DIFFERENT stream/sync than the MoE hidden/router DP gather under
+            # TBO → mismatched DP layouts → wrong V4 hash routing (GSM8K
+            # 0.95→0.87). NOTE: do NOT wrap this in the TBO ping-pong
+            # (tbo_yield_and_switch_*) — injecting an extra yield at forward top
+            # desyncs the ping-pong ring and collapses accuracy to ~0.54
+            # (measured). The ids tensor is [N,1] int (tiny vs hidden [N,7168]),
+            # so inline costs ~nothing in overlap.
+            ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
         elif moe_merge:
             # Hash MoE runs on the full token set in mode B (each Block
             # all-gathers hidden before MoE), so the ids it indexes must be full.
