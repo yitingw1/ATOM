@@ -45,12 +45,15 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from atom.distributed.pcp_utils import (
-    get_pcp_rank,
     get_pcp_world_size,
+    pcp_all_reduce,
+    pcp_allgather_rankmajor,
     pcp_allgather_rerange,
     pcp_pad_len,
+    pcp_reduce_scatter,
     pcp_round_robin_split,
 )
+from atom.utils.custom_register import direct_register_custom_op
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -2239,9 +2242,15 @@ class MoE(nn.Module):
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
         )
-        if self._use_dual_stream:
-            # Register self in static_forward_context so the custom op
-            # dispatcher can look us up by `layer_name` (= self.prefix).
+        # Register self in static_forward_context so the custom op dispatcher
+        # can look us up by `layer_name` (= self.prefix). Needed by
+        # maybe_dual_stream_forward (dual-stream) AND moe_pcp_merge_forward
+        # (PCP mode B, 阶段19) — the latter requires registration regardless of
+        # dual-stream, so register whenever either consumer is active.
+        _merge_on = get_pcp_world_size() > 1 and bool(
+            get_current_atom_config().parallel_config.moe_pcp_merge
+        )
+        if self._use_dual_stream or _merge_on:
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
@@ -2344,6 +2353,18 @@ class MoE(nn.Module):
         all-reduce across TP ranks.
         """
         if shared is not None:
+            # Scheme B (moe_pcp_merge, non-fused shared only): the shared expert
+            # is NOT pcp-sharded (its MergedColumn/RowParallelLinear bind to the
+            # 4-card tp group, so every pcp rank holds the same shared weights
+            # and computes the same full shared output — pcp-redundant). After
+            # this combine the result rides through Block.forward's pcp
+            # reduce_scatter, which SUMS the pcp partners. Without correction the
+            # shared part would be summed pcp_size times (doubled for pcp=2). So
+            # pre-scale shared by 1/pcp_size: the reduce_scatter then RESTORES it
+            # to 1x instead of multiplying. routed is genuinely pcp-sharded
+            # (partial sum) so it must NOT be scaled — only shared.
+            if _moe_pcp_merge_active() or _moe_pcp_merge_decode_active():
+                shared = shared * (1.0 / get_pcp_world_size())
             routed = routed + shared
         if self.tp_size > 1:
             routed = _run_on_tbo_comm_stream(tensor_model_parallel_all_reduce, routed)
@@ -2434,6 +2455,13 @@ class Block(nn.Module):
             compress_stream=compress_stream,
         )
         self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn", alt_stream=alt_stream)
+        # 阶段19: static (config-only, is_dummy-independent) gate for routing MoE
+        # through the opaque moe_pcp_merge_forward custom op. Constant across
+        # warmup/real so Dynamo specializes it identically -> the op call is
+        # baked into code0 and the gate inside the op stays dynamic.
+        self._moe_merge_enabled = get_pcp_world_size() > 1 and bool(
+            get_current_atom_config().parallel_config.moe_pcp_merge
+        )
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult
@@ -2629,61 +2657,24 @@ class Block(nn.Module):
             self.norm_eps,
         )
         x = hc_state.x_prev
-        # PCP MoE mode B: all-gather this rank's 1/W token shard back to the
-        # full (padded) sequence so MoE sees every token (MoE itself is
-        # untouched / PCP-agnostic), then slice the result back to 1/W to match
-        # the residual stream (which stays sharded throughout). Mode A leaves x
-        # at 1/W and MoE runs per-shard with no extra comm. Only `x` is
-        # gathered/sliced — fuse_hc already produced the 1/W ffn input, and the
-        # residual in hc_state remains 1/W. The gather length is the fixed
-        # padded total (not data-dependent), so it is torch.compile-safe like
-        # the K/V all-gather inside attention.forward_impl.
-        moe_merge = _moe_pcp_merge_active()
-        if moe_merge:
-            pcp_ws = get_pcp_world_size()
-            padded_total = x.shape[0] * pcp_ws  # full padded token count
-            x = pcp_allgather_rerange(x, pcp_ws)  # [1/W, dim] -> [full, dim]
-            # Drop the trailing dummy (pad) rows so MoE sees exactly the real
-            # token set — identical to the no-PCP (pcp=1) batch. Dummies sit at
-            # [n_real, padded_total) because entry padding appends zeros at the
-            # tail and stripe split + allgather-rerange preserve global order.
-            # Without this, padded dummies change the fp8 block-scale M-tiling /
-            # moe_sorting and perturb every real token's MoE output (mode B was
-            # ~5 gsm8k points below pcp=1; see plan §dual-path).
-            n_real = get_forward_context().context.pcp_n_real
-            n_pad = padded_total - n_real if n_real is not None else 0
-            if n_pad > 0:
-                x = x[:n_real]
-            if os.environ.get("ATOM_PCP_PROBE", ""):
-                x = torch.ops.aiter.pcp_probe(
-                    x, self.layer_id, n_real if n_real is not None else -1, n_pad
-                )
-        # MoE in/out dump (env ATOM_PCP_IO_DIR): mode B dumps post-dummy-drop
-        # full x; pcp=1 dumps native full x. Compare per-token to split
-        # "attention-side x differs" from "MoE not per-token".
-        _io_dbg = bool(os.environ.get("ATOM_PCP_IO_DIR", ""))
-        if _io_dbg and moe_merge:
-            x = _pcp_dump_io(self.layer_id, _DUMP_B_FULL, 1, x)
-        elif _io_dbg and _pcp_active():  # mode A: this rank's 1/W shard input
-            x = _pcp_dump_io(self.layer_id, _DUMP_A_SHARD, 1, x)
-        elif _io_dbg and get_pcp_world_size() <= 1 and _pcp_dump_is_prefill():
-            x = _pcp_dump_io(self.layer_id, _DUMP_P1_FULL, 1, x)
-        x = self.ffn(
-            x
-        )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)
-        if _io_dbg and moe_merge:
-            x = _pcp_dump_io(self.layer_id, _DUMP_B_FULL, 0, x)
-        elif _io_dbg and _pcp_active():
-            x = _pcp_dump_io(self.layer_id, _DUMP_A_SHARD, 0, x)
-        elif _io_dbg and get_pcp_world_size() <= 1 and _pcp_dump_is_prefill():
-            x = _pcp_dump_io(self.layer_id, _DUMP_P1_FULL, 0, x)
-        if moe_merge:
-            if n_pad > 0:
-                # Re-pad the dropped dummy rows (zeros) so the split below lines
-                # up with the 1/W residual stream; these rows land at a rank's
-                # tail and are clipped by the entry's h[:n_global] on exit.
-                x = torch.cat([x, x.new_zeros(n_pad, *x.shape[1:])], dim=0)
-            x = pcp_split_stripe(x, pcp_ws)  # [full, dim] -> [1/W, dim]
+        # PCP moe_pcp_merge (scheme B): MoE weights are sharded W*tp ways (pcp
+        # folded into tp/ep at build time), so each rank holds 1/(W*tp) of the
+        # experts and must see the full token set. 阶段19 (方向 C): the gate +
+        # merge collectives + MoE all run inside the OPAQUE moe_pcp_merge_forward
+        # custom op. Being a Dynamo barrier, the gate is read eagerly each call
+        # and never specialized/baked (the failure mode that killed the in-graph
+        # gate, 阶段16-18). The op is shape-preserving ([1/W,dim] in/out:
+        # prefill gathers->full, runs MoE, reduce_scatters->1/W; decode runs MoE
+        # then pcp all_reduce). `self._moe_merge_enabled` is a static config bool
+        # (is_dummy-independent) so Dynamo specializes it identically at warmup
+        # and real -> the op call is baked into code0; the runtime gate lives
+        # inside the op. Mode A / non-merge keeps the plain self.ffn path.
+        if self._moe_merge_enabled:
+            x = torch.ops.aiter.moe_pcp_merge_forward(x, self.ffn.prefix)
+        else:
+            x = self.ffn(
+                x
+            )  # [num_tokens, dim]  (input_ids from forward_context for hash MoE)
         hc_state.x_prev = x
         return hc_state
 
@@ -2754,145 +2745,78 @@ class ParallelHead(ParallelLMHead):
         return self.get_logits(norm(x))  # [bs, vocab]
 
 
-# Debug aid (PCP MoE mode B dump): layers already dumped, so we print the
-# A-vs-B per-token diff only on the first prefill forward of each layer.
-_PCP_DUMP_SEEN_LAYERS: set = set()
-
-# Phase B: dump per-layer MoE output to disk for offline mode-A vs mode-B
-# compare. Gated by env ATOM_PCP_DUMP_DIR (set in the worker via the launch
-# command). torch._dynamo.disable forces eager execution so the torch.save
-# side effect is NOT swallowed by the compiled graph (the reason in-graph
-# print/save vanished in earlier attempts). Only first prefill forward per
-# (layer, rank) is saved (dedup via the file existing / seen set is per-proc).
-_PCP_DUMP_B_SEEN: set = set()
-
-# Dump mode codes (int, not str/bool — custom op args must be plain scalars and
-# a bool can't distinguish three cases). Maps to the on-disk filename tag.
-_DUMP_A_SHARD = 0  # mode A: this rank's 1/W stripe MoE output
-_DUMP_B_FULL = 1  # mode B: full [N,dim] global-order MoE output (pre-split)
-_DUMP_P1_FULL = 2  # pcp=1 ground truth: native full-token MoE output
-_DUMP_MODE_TAG = {_DUMP_A_SHARD: "A_shard", _DUMP_B_FULL: "B_full", _DUMP_P1_FULL: "P1_full"}
+# ===== 阶段19 (方向 C): PCP MoE merge as an OPAQUE custom op =====
+# The whole "gate + merge collectives + MoE" runs inside this custom op. Being
+# a Dynamo barrier, the gate (read from forward_context) is evaluated EAGERLY on
+# every invocation and is NEVER specialized/baked — which is what defeated the
+# in-graph gate (阶段16-18: torch.compile traced the gate to its warmup value,
+# dispatch_to_code(0) then froze it). The op is shape-preserving
+# ([n_local, dim] in/out: prefill gathers 1/W->full, runs MoE, reduce_scatters
+# full->1/W; decode runs MoE then pcp all_reduce), so the fake impl is
+# empty_like and Dynamo needs no dynamic-shape reasoning. prefill/decode split
+# on the REAL is_prefill read inside the op: decode's cudagraph capture (阶段18:
+# is_prefill=False, is_dummy=False) bakes the all_reduce kernel into the decode
+# graph; prefill (no cudagraph) runs the gather/scatter eagerly each call. The
+# gate KEEPS is_dummy_run (via _moe_pcp_merge_active/_decode_active) so it stays
+# consistent with the out-of-graph split gate _pcp_active: at warmup
+# (is_dummy=True) it neither splits nor merges. Opacity — NOT removing is_dummy
+# — is what avoids the specialization that killed the in-graph gate (阶段16-18).
 
 
-def _pcp_dump_moe_impl(out: torch.Tensor, layer_id: int, mode: int) -> torch.Tensor:
-    """Custom-op body: save MoE output, return out unchanged (passthrough).
-    Registered as a torch custom op so it is a true Dynamo barrier — plain
-    Python side effects (print / torch.save / @dynamo.disable) inside the
-    compiled Block.forward are silently dropped, but a custom op is not.
-    mode: 0=A_shard [1/W,dim] this rank's stripe, 1=B_full [full,dim] global
-    order, 2=P1_full pcp=1 ground truth. Reads env dynamically (spawn-safe)."""
-    dump_dir = os.environ.get("ATOM_PCP_DUMP_DIR", "")
-    tag = _DUMP_MODE_TAG.get(mode, f"mode{mode}")
-    if dump_dir:
-        rank = get_pcp_rank()
-        key = (layer_id, rank, mode)
-        if key not in _PCP_DUMP_B_SEEN:
-            _PCP_DUMP_B_SEEN.add(key)
-            path = f"{dump_dir}/moe_{tag}_layer{layer_id:02d}_rank{rank}.pt"
-            torch.save(out.detach().float().cpu(), path)
-    return out.clone()
+def _run_moe(moe: "MoE", x: torch.Tensor) -> torch.Tensor:
+    """Replicate MoE.forward's dual/single dispatch (we are already inside an
+    opaque op, so call the underlying methods directly rather than re-entering
+    the maybe_dual_stream_forward custom op)."""
+    threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+    num_tokens = x.shape[0]
+    if moe._use_dual_stream and 0 < num_tokens <= threshold:
+        return moe.dual_stream_moe_forward(x)
+    return moe.single_stream_moe_forward(x)
 
 
-def _pcp_dump_moe_fake(out: torch.Tensor, layer_id: int, mode: int) -> torch.Tensor:
-    return torch.empty_like(out)
+def moe_pcp_merge_forward(
+    hidden_states: torch.Tensor,  # [n_local, dim]
+    layer_name: str,
+) -> torch.Tensor:  # [n_local, dim]  (shape-preserving)
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    # Gate is read EAGERLY here (op is opaque to Dynamo), so it is NEVER baked —
+    # keeping is_dummy_run in the gate is correct and NECESSARY: it keeps this op
+    # consistent with the out-of-graph split gate `_pcp_active()` (also has
+    # is_dummy). At warmup (is_dummy=True) neither splits nor merges, so x stays
+    # full and the hash-MoE input_ids (also un-split at warmup) match. Removing
+    # is_dummy here would merge a never-split warmup batch -> input_ids/hidden
+    # length mismatch -> crash. (The in-graph gate needed is_dummy *removed* to
+    # bake True into code0; the opaque op does NOT — opacity is the fix.)
+    do_prefill = _moe_pcp_merge_active()
+    do_decode = _moe_pcp_merge_decode_active()
+    ws = get_pcp_world_size()
+    x = hidden_states
+    if do_prefill:
+        x = pcp_allgather_rankmajor(x, ws)  # [1/W,dim] -> [full,dim]
+    x = _run_moe(moe, x)
+    if do_prefill:
+        x = pcp_reduce_scatter(x, ws)  # [full,dim] -> [1/W,dim]
+    elif do_decode:
+        x = pcp_all_reduce(x)  # sum pcp half (decode tokens are pcp-redundant)
+    return x
 
 
-direct_register_custom_op(
-    op_name="pcp_dump_moe",
-    op_func=_pcp_dump_moe_impl,
-    mutates_args=(),
-    fake_impl=_pcp_dump_moe_fake,
-)
-
-
-def _pcp_dump_moe_out(layer_id: int, mode: int, out: torch.Tensor) -> torch.Tensor:
-    return torch.ops.aiter.pcp_dump_moe(out, layer_id, mode)
-
-
-# In-graph probe for the mode-B dummy-drop fix: prints the actual n_real / shape
-# at runtime (a custom op survives the compiled graph; plain print is dropped).
-# Env-gated by ATOM_PCP_PROBE; logs only the first call per layer/rank.
-_PCP_PROBE_SEEN: set = set()
-
-
-def _pcp_probe_impl(x: torch.Tensor, layer_id: int, n_real: int, n_pad: int) -> torch.Tensor:
-    if os.environ.get("ATOM_PCP_PROBE", ""):
-        rank = get_pcp_rank()
-        key = (layer_id, rank)
-        if key not in _PCP_PROBE_SEEN:
-            _PCP_PROBE_SEEN.add(key)
-            try:
-                with open("/tmp/pcp_probe.txt", "a") as f:
-                    f.write(f"layer={layer_id} rank={rank} x.shape0={x.shape[0]} "
-                            f"n_real={n_real} n_pad={n_pad}\n")
-            except Exception:  # noqa: BLE001
-                pass
-    return x.clone()
-
-
-def _pcp_probe_fake(x: torch.Tensor, layer_id: int, n_real: int, n_pad: int) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-direct_register_custom_op(
-    op_name="pcp_probe",
-    op_func=_pcp_probe_impl,
-    mutates_args=(),
-    fake_impl=_pcp_probe_fake,
-)
-
-
-# ---- MoE input/output dump for mode-B vs P1 per-token compare ----
-# Dumps BOTH the MoE input x (post-gather, post-dummy-drop, pre-ffn) and the
-# MoE output, in full global token order. Lets us split "attention-side x
-# already differs" from "MoE itself is not per-token". Env ATOM_PCP_IO_DIR.
-# is_in: 1 => MoE input, 0 => MoE output. mode tag from _DUMP_MODE_TAG.
-_PCP_IO_SEEN: set = set()
-
-
-def _pcp_dump_io_impl(
-    t: torch.Tensor, layer_id: int, mode: int, is_in: int
+def _moe_pcp_merge_forward_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
 ) -> torch.Tensor:
-    dump_dir = os.environ.get("ATOM_PCP_IO_DIR", "")
-    if dump_dir:
-        rank = get_pcp_rank()
-        tag = _DUMP_MODE_TAG.get(mode, f"mode{mode}")
-        io = "in" if is_in else "out"
-        # Key by token count too so the multi-request (larger N) batch and any
-        # single-request warmup forward land in distinct files instead of the
-        # first one shadowing the rest.
-        n = int(t.shape[0])
-        key = (layer_id, rank, mode, is_in, n)
-        if key not in _PCP_IO_SEEN:
-            _PCP_IO_SEEN.add(key)
-            path = f"{dump_dir}/moeio_{tag}_{io}_layer{layer_id:02d}_rank{rank}_n{n:04d}.pt"
-            torch.save(t.detach().float().cpu(), path)
-    return t.clone()
-
-
-def _pcp_dump_io_fake(
-    t: torch.Tensor, layer_id: int, mode: int, is_in: int
-) -> torch.Tensor:
-    return torch.empty_like(t)
+    return torch.empty_like(hidden_states)
 
 
 direct_register_custom_op(
-    op_name="pcp_dump_io",
-    op_func=_pcp_dump_io_impl,
+    op_name="moe_pcp_merge_forward",
+    op_func=moe_pcp_merge_forward,
     mutates_args=(),
-    fake_impl=_pcp_dump_io_fake,
+    fake_impl=_moe_pcp_merge_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
 )
-
-
-def _pcp_dump_io(layer_id: int, mode: int, is_in: int, t: torch.Tensor) -> torch.Tensor:
-    return torch.ops.aiter.pcp_dump_io(t, layer_id, mode, is_in)
-
-
-def _pcp_dump_is_prefill() -> bool:
-    """Real prefill (not decode / dummy warmup), regardless of PCP. Used to gate
-    the pcp=1 ground-truth dump where _pcp_active() is always False."""
-    fc = get_forward_context()
-    return fc.context.is_prefill and not fc.context.is_dummy_run
 
 
 def _pcp_active() -> bool:
@@ -2919,6 +2843,24 @@ def _moe_pcp_merge_active() -> bool:
     if not _pcp_active():
         return False
     return bool(get_current_atom_config().parallel_config.moe_pcp_merge)
+
+
+def _moe_pcp_merge_decode_active() -> bool:
+    """moe_pcp_merge DECODE path: MoE weights are sharded W*tp ways (pcp folded
+    into tp at build time), but decode does NOT stripe-split tokens — every pcp
+    rank holds the same full batch. So decode skips gather/reduce_scatter and
+    instead does one pcp all_reduce after MoE to sum the pcp-half of the
+    intermediate that combine_outputs' tp all_reduce misses.
+
+    True only when pcp>1, moe_pcp_merge set, and this is a real DECODE forward
+    (not prefill — that's `_moe_pcp_merge_active` — and not dummy/warmup).
+    """
+    if get_pcp_world_size() <= 1:
+        return False
+    if not bool(get_current_atom_config().parallel_config.moe_pcp_merge):
+        return False
+    fc = get_forward_context()
+    return (not fc.context.is_prefill) and (not fc.context.is_dummy_run)
 
 
 @support_torch_compile
@@ -3009,7 +2951,7 @@ class DeepseekV4Model(nn.Module):
         hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None)
 
         for layer in self.layers:
-            hc_state = layer(hc_state, positions)  # [num_tokens, hc, dim]
+            hc_state = layer(hc_state, positions)
         h = self.layers[-1].hc_post(
             hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix
         )
@@ -3142,6 +3084,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         # runs entirely on 1/W; the final hidden is all-gathered + un-padded
         # after self.model(...) returns.
         use_pcp = _pcp_active()
+        # NOTE: moe_merge here is the OUT-OF-GRAPH gate, used only for the
+        # input_ids gather below (round-robin split + hash-MoE id alignment).
+        # The MoE merge collectives gate themselves separately inside the opaque
+        # moe_pcp_merge_forward custom op (called from Block.forward, 阶段19).
         moe_merge = _moe_pcp_merge_active()
         # Mode B is incompatible with DP-attention id-gathering for now: both
         # rewrite ctx.context.input_ids with different (full-PCP vs DP-gathered)
@@ -3158,13 +3104,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             if pad > 0:
                 input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
                 positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
-            # Mode B: stash the full (padded, global-order) ids for hash MoE,
-            # which sees full tokens after the per-layer all-gather. The token
-            # order matches pcp_allgather_rerange's reconstruction in Block.
-            if moe_merge:
-                full_padded_ids = input_ids
             input_ids = pcp_round_robin_split(input_ids, pcp_size)
             positions = pcp_round_robin_split(positions, pcp_size)
+            # Scheme B: each Block rank-major all-gathers hidden before MoE
+            # (pcp_allgather_rankmajor = plain all_gather(dim=0), RANK-MAJOR
+            # order: [rank0's stripe | rank1's stripe | ...]). The hash MoE
+            # indexes input_ids per hidden row, so the ids must be gathered in
+            # the SAME rank-major order. pcp_allgather_rankmajor is int-safe
+            # (plain all_gather), so reuse it for the ids too.
+            if moe_merge:
+                full_padded_ids = pcp_allgather_rankmajor(input_ids, pcp_size)
 
         if self._need_ids_gather:
             # DP-attention (no EP) hash routing: input_ids is local but the MoE
@@ -3180,18 +3129,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             # so inline costs ~nothing in overlap.
             ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
         elif moe_merge:
-            # Hash MoE runs on the full token set in mode B (each Block
-            # all-gathers hidden before MoE), so the ids it indexes must be full.
+            # Scheme B: hash MoE runs on the rank-major full token set (each
+            # Block rank-major all-gathers hidden before MoE), so the ids it
+            # indexes must be the matching rank-major full ids.
             ctx.context.input_ids = full_padded_ids
-            # Real (pre-pad) token count so each Block can drop the trailing
-            # dummy rows before MoE (mode B), making the expert batch match the
-            # no-PCP (pcp=1) batch. Dummies sit at full index [n_global, pad_len)
-            # because entry padding appends zeros at the tail.
-            ctx.context.pcp_n_real = n_global
-            if os.environ.get("ATOM_PCP_PROBE", ""):
-                print(f"[PCP-PROBE entry] n_global={n_global} pad={pad} "
-                      f"padded_total={n_global+pad} pcp_n_real set={ctx.context.pcp_n_real}",
-                      flush=True)
         else:
             ctx.context.input_ids = input_ids
         h = self.model(input_ids, positions)
